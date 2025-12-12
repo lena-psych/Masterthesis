@@ -1,0 +1,406 @@
+---
+title: "Linear Mixed Model Bootstrap"
+author: "Lena Schubert"
+date: "2024-11-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/lenas/OneDrive - uni-bielefeld.de/Dokumente/Uni/Master_Klinische_Psychologie/Masterarbeit/Datensätze/Datensätze_gekürzt")
+```
+
+## Laden der Pakete
+
+```{r}
+library(nlme)
+library(lme4)
+library(dplyr)
+library(foreign)
+library(haven)
+require(MBESS)
+require(reshape2)
+library(ggplot2)
+library(tidyr)
+library(emmeans)
+emm_options(pbkrtest.limit = 20000, lmerTest.limit = 20000)
+library(purrr)
+library(readr)
+```
+
+
+## Laden des Datensatz
+
+Direkt im Long Format und mit Gruppe und Zeit als Faktor (richtige Reihenfolge beachten, sonst Prä und KG als Referenz definieren)
+
+Name des Datensatz: Autor_long.csv
+
+
+```{r}
+df <- read_csv2("Berking_long.csv", show_col_types = FALSE) %>%
+  mutate(
+    Group   = factor(Group,   levels = c("KG", "EG")),
+    timeFac = factor(timeFac, levels = c("Prä", "Post", "FU"))
+  )
+```
+
+### Zeit als Faktor?
+
+```{r}
+str (df)
+```
+
+
+## Lineares Mixed Model definieren (lme4)
+
+1.Variable value enthält Werte des Outcomes der jeweiligen Studie
+2.Variable Group enthält die Zuordnung Kontroll (0) vs. Treatmentgruppe (1)
+3.Variable time Fac: enthält die drei Messzeitounkte als Faktor kodiert 
+
+Vorhersage der Variable values durch die Faktoren Zeit und Gruppe. Es handelt sich um eine Cross Level Interaktion, da der Prädiktor Gruppe ein Level 2 Prädiktor ist. 
+
+
+
+```{r}
+model <- lmer(
+  value ~ Group * timeFac + (1 | ParticipantID), # feste Effekte + zufälliger Intercept
+  data = df,
+  REML = FALSE # entspricht method = "ML"
+)
+
+summary(model)
+```
+## Output
+
+(Intercept) = Mittelwert der Kontrollgruppe bei Prä
+
+GroupEG = Unterschied zwischen Treatment- und Kontrollgruppe bei Prä	
+
+timeFacPost = Veränderung von KG von Prä zu Post:
+
+timeFacFU = Veränderung von KG von Prä zu Follow-Up
+
+GroupTreatment:timeFacPost = Zusätzliche Veränderung der EG im Vergleich zur KG von Prä zu Post. 
+
+GroupTreatment:timeFacFU = Zusätzliche Veränderung der EG im Vergleich zur KG von Prä zu FU. 
+
+
+## Emmeans Methode für Gruppenunterschiede
+
+```{r}
+emm <- emmeans(model, ~ Group | timeFac)
+
+# Alle Gruppenmittelwerte pro Zeitpunkt
+emm
+
+```
+## Gruppenvergleich pro Zeitpunkt (Treatment-Kontroll)
+
+
+```{r}
+contrasts_orig <- contrast(emm, method = "revpairwise", adjust = "none")
+contrasts_orig
+```
+## Original Parameter (Estimate) der extrahieren (für Coverage später)
+
+Dieser Wert ist der "wahre" Mittelwertsunterschied zu den Zeitpunkten. Bei der Coverage schauen wir, wie oft die Konfidenzintervalle den wahren Paramter enthalten.
+
+```{r}
+true_contr <- as.data.frame(contrast(emm, method = "revpairwise", adjust = "none")) %>%
+  transmute(
+    timeFac  = trimws(as.character(timeFac)),
+    true_est = estimate
+  )
+
+```
+
+
+## Visualisierung Mittelwerte der Gruppen pro Zeitpunkt
+
+```{r}
+plot(emm, comparisons = TRUE, by = "timeFac")
+```
+
+## Visualisierung Interaktion 
+
+```{r}
+emmip(model, Group ~ timeFac, ylab = "Mittelwerte", xlab = "Zeitpunkte")
+```
+
+
+## Bootstrap 
+
+### Bootstrap Schleife stratifiziert
+
+stratifiziert: ziehen so, dass Gruppengröße beibehalten wird
+
+```{r}
+
+set.seed(123)
+B <- 1000L
+
+# Stratifiziertes Cluster-Resampling (ganze Person/Cluster)
+cluster_resample_strat <- function(dat, id_var = "ParticipantID", group_var = "Group") {
+  split_grp <- split(dat, dat[[group_var]])
+  purrr::imap_dfr(split_grp, function(dg, gname) {
+    ids  <- unique(dg[[id_var]])
+    m    <- length(ids)                     # Originalzahl Subjekte in dieser Gruppe
+    draw <- sample(ids, m, replace = TRUE)  # Ziehung innerhalb der Gruppe
+    purrr::map2_dfr(draw, seq_along(draw), function(id, i) {
+      tmp <- dg[dg[[id_var]] == id, , drop = FALSE]
+      # Relabeln verhindert Kollisionen in (1 | ParticipantID)
+      tmp[[id_var]] <- paste0(tmp[[id_var]], "__", gname, "_", i)
+      tmp
+    })
+  })
+}
+
+# Level-Namen (für NA-Zeilen bei Ausfällen)
+lvl_time  <- levels(df$timeFac);  if (is.null(lvl_time))  lvl_time  <- sort(unique(df$timeFac))
+lvl_group <- levels(df$Group);    if (is.null(lvl_group)) lvl_group <- sort(unique(df$Group))
+
+boot_emm <- vector("list", B)
+boot_ctr <- vector("list", B)
+
+# Container für Gruppengrößen je Iteration (distinct Personen, nicht Zeilen)
+group_counts <- data.frame(iter = 1:B, KG = NA_integer_, EG = NA_integer_)
+
+# Originale Personenanzahl je Gruppe zum Vergleich
+orig_counts <- df %>%
+  distinct(ParticipantID, Group) %>%
+  count(Group, name = "n") %>%
+  tidyr::pivot_wider(names_from = Group, values_from = n)
+
+for (b in seq_len(B)) {
+  #  STRATIFIZIERTES Cluster-Resampling 
+  boot_df <- cluster_resample_strat(df, id_var = "ParticipantID", group_var = "Group")
+
+  # Gruppengrößen (distinct Personen je Gruppe) mitschreiben
+  cnt_tbl <- table(factor(
+    boot_df %>% distinct(ParticipantID, Group) %>% pull(Group),
+    levels = c("KG","EG")
+  ))
+  group_counts[b, c("KG","EG")] <- as.integer(cnt_tbl)
+
+  fit <- try(
+    lmer(
+      value ~ Group * timeFac + (1 | ParticipantID),
+      data = boot_df,
+      REML = FALSE
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(fit, "try-error")) {
+    # Fallback-NA-Zeilen, falls eine Iteration fehlschlägt
+    boot_emm[[b]] <- expand_grid(
+      iter = b, timeFac = lvl_time, Group = lvl_group
+    ) |>
+      mutate(emmean = NA_real_, SE = NA_real_, df = NA_real_,
+             lower.CL = NA_real_, upper.CL = NA_real_)
+
+    boot_ctr[[b]] <- tibble(
+      iter = b, timeFac = lvl_time,
+      estimate = NA_real_, SE = NA_real_, df = NA_real_,
+      t.ratio = NA_real_, p.value = NA_real_
+    )
+    next
+  }
+
+  # Emmeans pro Zeitpunkt
+  emm_obj <- emmeans(fit, ~ Group | timeFac)
+  emm_df  <- as.data.frame(emm_obj) |>
+    mutate(iter = b) |>
+    select(iter, timeFac, Group, emmean, SE, df, lower.CL, upper.CL)
+  boot_emm[[b]] <- emm_df
+
+  # Kontraste: Treatment-Kontrolle (EG vs KG)
+  ctr_df <- as.data.frame(contrast(emm_obj, method = "revpairwise", adjust = "none")) |>
+    mutate(iter = b) |>
+    select(iter, timeFac, estimate, SE, df, t.ratio, p.value)
+  boot_ctr[[b]] <- ctr_df
+}
+
+# Zusammenführen
+boot_emm_df       <- bind_rows(boot_emm)
+boot_contrasts_df <- bind_rows(boot_ctr)
+
+# Auswertung der Gruppenverteilung nach der Schleife 
+group_sizes_long <- group_counts %>%
+  tidyr::pivot_longer(cols = c(KG, EG), names_to = "Group", values_to = "n")
+
+group_sizes_summary <- group_sizes_long %>%
+  group_by(Group) %>%
+  summarise(
+    mean_n = mean(n, na.rm = TRUE),
+    sd_n   = sd(n,   na.rm = TRUE),
+    min_n  = min(n,  na.rm = TRUE),
+    max_n  = max(n,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(group_sizes_summary)
+
+
+```
+
+### Gruppenverteilung Bootstrap
+```{r}
+table(boot_df$Group)
+```
+
+### Gruppenverteilung Original
+
+```{r}
+table(df$Group)
+```
+
+
+# Visualisierung 
+
+### Schätzwerte der Kontraste
+
+```{r}
+ggplot(boot_contrasts_df, aes(x = estimate)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ timeFac, scales = "free") +
+  labs(title = "Kontraste (Treatment-Kontroll): Verteilung der Schätzungen",
+       x = "Estimate", y = "Häufigkeit")
+```
+
+### T Werte der Kontraste
+```{r}
+ggplot(boot_contrasts_df, aes(x = t.ratio)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ timeFac, scales = "free") +
+  labs(title = "t-Ratios der Kontraste", x = "t.ratio", y = "Häufigkeit")
+```
+
+### p-Werte der Kontraste
+```{r}
+ggplot(boot_contrasts_df, aes(x = p.value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ timeFac) +
+  labs(title = "p-Werte der Kontraste", x = "p", y = "Häufigkeit")
+```
+
+
+### Tabelle mit Power, Coverage, RMSE und Bias
+
+```{r}
+
+# 1) Wahrer Wert (aus dem Original-Fit via emmeans/contrast)
+
+
+true_contr <- as.data.frame(contrast(emm, method = "revpairwise", adjust = "none")) %>%
+  transmute(
+    timeFac     = trimws(as.character(timeFac)),
+    True_Effect = estimate
+  )
+
+
+# 2) Power aus den Bootstrap-Kontrasten
+
+power_tbl <- boot_contrasts_df %>%
+  mutate(timeFac = trimws(as.character(timeFac))) %>%
+  group_by(timeFac) %>%
+  summarise(
+    Power  = mean(p.value < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# 3) Coverage (per Wald-CI mit t-Kritischem Wert je Iteration)
+
+coverage_tbl <- boot_contrasts_df %>%
+  mutate(timeFac = trimws(as.character(timeFac))) %>%
+  mutate(crit = qt(0.975, df),
+         lower = estimate - crit * SE,
+         upper = estimate + crit * SE) %>%
+  inner_join(true_contr, by = "timeFac") %>%
+  group_by(timeFac) %>%
+  summarise(
+    Coverage = mean(True_Effect >= lower & True_Effect <= upper, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# 4) RMSE & Bias
+
+rmse_tbl <- boot_contrasts_df %>%
+  mutate(timeFac = trimws(as.character(timeFac))) %>%
+  inner_join(true_contr, by = "timeFac") %>%
+  group_by(timeFac) %>%
+  summarise(
+    RMSE = sqrt(mean((estimate - True_Effect)^2, na.rm = TRUE)),
+    Bias = mean(estimate - True_Effect, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# 5) Alles in eine gemeinsame Tabelle
+
+
+lmm_summary <- true_contr %>%
+  left_join(power_tbl,    by = "timeFac") %>%
+  left_join(coverage_tbl, by = "timeFac") %>%
+  left_join(rmse_tbl,     by = "timeFac") %>%
+  select(timeFac, True_Effect, Power, Coverage, RMSE, Bias) %>%
+  arrange(timeFac)
+
+
+
+# Ausgabe
+print(lmm_summary)
+
+```
+
+
+
+### Visualisierung Histogramme Verteilung der Schätzer
+
+```{r}
+## Bootstrap-Schätzer für "Post" herausziehen 
+boot_post_est <- boot_contrasts_df |>
+  transform(timeFac_chr = trimws(as.character(timeFac))) |>
+  subset(timeFac_chr == "Post") |>
+  with(estimate)
+boot_post_est <- boot_post_est[is.finite(boot_post_est)]  # NAs raus
+
+##  „Wahrer“ Wert für "Post" holen 
+true_ate_post <- true_contr |>
+  subset(timeFac == "Post") |>
+  with(True_Effect)
+true_ate_post <- true_ate_post[1]  # falls mehrfach vorhanden
+
+## Plot: Histogramm + vertikale Linie für wahren Wert 
+hist(
+  boot_post_est,
+  main = "Bootstrap estimates for Post contrast",
+  xlab = "Estimate (Post)"
+)
+abline(v = true_ate_post, col = "red", lwd = 2)
+```
+```{r}
+##  Bootstrap-Schätzer für "FU" herausziehen 
+boot_fu_est <- boot_contrasts_df |>
+  transform(timeFac_chr = trimws(as.character(timeFac))) |>
+  subset(timeFac_chr == "FU") |>
+  with(estimate)
+boot_fu_est <- boot_fu_est[is.finite(boot_fu_est)]  # NAs raus
+
+##  „Wahrer“ Wert für "FU" holen 
+true_ate_fu <- true_contr |>
+  subset(timeFac == "FU") |>
+  with(True_Effect)
+true_ate_fu <- true_ate_fu[1]  # falls mehrfach vorhanden
+
+## Plot: Histogramm + vertikale Linie für wahren Wert 
+hist(
+  boot_fu_est,
+  main = "Bootstrap estimates for FU contrast",
+  xlab = "Estimate (FU)"
+)
+abline(v = true_ate_fu, col = "blue", lwd = 2)
+```
+

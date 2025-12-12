@@ -1,0 +1,269 @@
+---
+title: "T Test Skript"
+author: "Lena Schubert"
+date: "2025-08-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/lenas/OneDrive - uni-bielefeld.de/Dokumente/Uni/Master_Klinische_Psychologie/Masterarbeit/Datensätze/Datensätze_gekürzt")
+```
+
+### Pakete Laden
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(naniar)
+library(car)
+library(readr)
+```
+
+### Daten laden
+
+Name des Datensatz: Autor_short.csv
+
+```{r}
+df <- read_csv(
+  "Woud_short.csv",
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Group = factor(Group,
+                   levels = c("EG", "KG"),
+                   labels = c("EG", "KG"))
+  )
+```
+
+### Sicherstellen, das Group als Faktor vorliegt
+
+```{r}
+str (df)
+```
+
+
+# Inferenzstatisitk
+
+
+### Change-from-Baseline Scores berechnen
+```{r}
+df$change_post <- df$Post - df$Prä
+df$change_fu   <- df$FU - df$Prä
+```
+
+
+### t-Test für Post Change-from-Baseline
+
+Hier werden die Mittelwerte der Change Scores der beiden Gruppen verglichen. Diese Werte dienen als Grundlage für die Bewertung unserer Bootstrap Samples, da wir diese als "wahren" Wert annehmen. 
+```{r}
+t_post <- t.test(change_post ~ Group, data = df, var.equal = TRUE)
+print(t_post)
+```
+
+### t-Test für Follow-up Change-from-Baseline
+
+```{r}
+t_fu <- t.test(change_fu ~ Group, data = df, var.equal = TRUE)
+print(t_fu)
+```
+
+# Bootstrap Verfahren
+
+
+### Bootstrap für Change Scores Post Messung und Follow Up
+
+Berechnet Mittelwertsunterschiede der Change Scores zu den jeweiligen Zeitpunkten (Post und Follow Up)
+
+
+### Bootstrap stratifiziert
+
+```{r}
+set.seed(123)
+Nrep <- 1000L
+
+# Level-Reihenfolge im Ausgangsdatensatz fixieren
+df$Group <- factor(df$Group, levels = c("KG","EG"))
+
+n    <- nrow(df)
+
+# Container
+est_post <- se_post <- df_post <- l_post <- u_post <- p_post <- numeric(Nrep)
+est_fu   <- se_fu   <- df_fu   <- l_fu   <- u_fu   <- p_fu   <- numeric(Nrep)
+
+# Container für Gruppengrößen je Iteration 
+group_counts <- data.frame(iter = 1:Nrep, KG = NA_integer_, EG = NA_integer_)
+
+# Original-Verteilung (Personen/Zeilen im df, hier 1 Zeile pro Person)
+tab   <- table(df$Group)
+n_KG  <- as.integer(tab["KG"])
+n_EG  <- as.integer(tab["EG"])
+
+for (i in seq_len(Nrep)) {
+ 
+  # STRATIFIZIERTES Resampling
+  
+  dKG <- df %>%
+    filter(Group == "KG") %>%
+    slice_sample(n = n_KG, replace = TRUE)
+
+  dEG <- df %>%
+    filter(Group == "EG") %>%
+    slice_sample(n = n_EG, replace = TRUE)
+
+  newdata <- bind_rows(dKG, dEG)
+
+  newdata <- newdata[sample.int(nrow(newdata)), , drop = FALSE]
+
+  # Levels pro Iteration stabil halten
+  newdata$Group <- factor(newdata$Group, levels = c("EG","KG"))
+
+  # Gruppengrößen mitschreiben (sollten konstant bleiben)
+  cnt <- table(factor(newdata$Group, levels = c("EG","KG")))
+  group_counts[i, c("KG","EG")] <- as.integer(cnt)
+
+  # Post 
+  tt_post <- t.test(change_post ~ Group, data = newdata, var.equal = TRUE)
+  est_post[i]  <- unname(tt_post$estimate[[1]] - tt_post$estimate[[2]])
+  se_post[i]   <- tt_post$stderr
+  df_post[i]   <- unname(tt_post$parameter)
+  l_post[i]    <- tt_post$conf.int[1]
+  u_post[i]    <- tt_post$conf.int[2]
+  p_post[i]    <- tt_post$p.value
+
+
+  # Follow-up 
+  tt_fu <- t.test(change_fu ~ Group, data = newdata, var.equal = TRUE)
+  est_fu[i]    <- unname(tt_fu$estimate[[1]] - tt_fu$estimate[[2]])
+  se_fu[i]     <- tt_fu$stderr
+  df_fu[i]     <- unname(tt_fu$parameter)
+  l_fu[i]      <- tt_fu$conf.int[1]
+  u_fu[i]      <- tt_fu$conf.int[2]
+  p_fu[i]      <- tt_fu$p.value
+}
+
+# In Dataframe bringen
+ttest_boot <- tibble(
+  iter = seq_len(Nrep),
+  est_post, se_post, df_post, l_post, u_post, p_post,
+  est_fu,   se_fu,   df_fu,   l_fu,   u_fu,   p_fu
+)
+
+# Auswertung der Gruppenverteilung 
+group_sizes_long <- group_counts |>
+  pivot_longer(cols = c(KG, EG), names_to = "Group", values_to = "n")
+
+group_sizes_summary <- group_sizes_long |>
+  group_by(Group) |>
+  summarise(
+    mean_n = mean(n, na.rm = TRUE),
+    sd_n   = sd(n,   na.rm = TRUE),
+    min_n  = min(n,  na.rm = TRUE),
+    max_n  = max(n,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(group_sizes_summary)
+
+```
+
+### Power-Schätzung
+```{r}
+power_post <- mean(p_post < 0.05, na.rm = TRUE)
+power_fu   <- mean(p_fu < 0.05, na.rm = TRUE)
+
+power_post
+power_fu
+```
+
+## Wahre Werte extrahieren
+
+wahre Werte sind hier auf Basis der Change Scores. Zum Vergleich für Coverage und RMSE.
+```{r}
+true_post <- unname(unname(t_post$estimate)[1] - unname(t_post$estimate)[2])
+true_fu   <- unname(unname(t_fu$estimate)[1] - unname(t_fu$estimate)[2])
+
+true_post
+true_fu
+```
+
+
+### Coverage
+
+```{r}
+ttest_coverage_tbl <- bind_rows(
+  tibble(
+    timeFac = "Post",
+    coverage = mean(true_post >= l_post & true_post <= u_post, na.rm = TRUE),
+    n_iter   = sum(!is.na(l_post) & !is.na(u_post))
+  ),
+  tibble(
+    timeFac = "FU",
+    coverage = mean(true_fu >= l_fu & true_fu <= u_fu, na.rm = TRUE),
+    n_iter   = sum(!is.na(l_fu) & !is.na(u_fu))
+  )
+)
+
+ttest_coverage_tbl
+```
+
+
+### RMSE
+
+```{r}
+ttest_rmse_tbl <- bind_rows(
+  tibble(
+    timeFac = "Post",
+    RMSE   = sqrt(mean((est_post - true_post)^2, na.rm = TRUE)),
+    Bias   = mean(est_post - true_post, na.rm = TRUE),
+    Var    = var(est_post, na.rm = TRUE),
+    n_iter = sum(!is.na(est_post))
+  ),
+  tibble(
+    timeFac = "FU",
+    RMSE   = sqrt(mean((est_fu - true_fu)^2, na.rm = TRUE)),
+    Bias   = mean(est_fu - true_fu, na.rm = TRUE),
+    Var    = var(est_fu, na.rm = TRUE),
+    n_iter = sum(!is.na(est_fu))
+  )
+)
+
+ttest_rmse_tbl
+```
+
+### Tabelle mit Coverage, Power, RMSE und Bias
+
+```{r}
+# Wahre Werte (EG − KG), robust bzgl. Level-Reihenfolge 
+df$Group <- factor(df$Group, levels = c("KG","EG"))
+
+true_post <- unname(unname(t_post$estimate)[1] - unname(t_post$estimate)[2])
+true_fu   <- unname(unname(t_fu$estimate)[1] - unname(t_fu$estimate)[2])
+
+# Power 
+power_post <- mean(p_post < 0.05, na.rm = TRUE)
+power_fu   <- mean(p_fu   < 0.05, na.rm = TRUE)
+
+# Coverage (Anteil der CIs, die den wahren Wert enthalten) 
+coverage_post <- mean(true_post >= l_post & true_post <= u_post, na.rm = TRUE)
+coverage_fu   <- mean(true_fu   >= l_fu   & true_fu   <= u_fu,   na.rm = TRUE)
+
+# RMSE & Bias 
+rmse_post <- sqrt(mean((est_post - true_post)^2, na.rm = TRUE))
+rmse_fu   <- sqrt(mean((est_fu   - true_fu  )^2, na.rm = TRUE))
+
+bias_post <- mean(est_post - true_post, na.rm = TRUE)
+bias_fu   <- mean(est_fu   - true_fu,   na.rm = TRUE)
+
+# Zusammenfassungstabelle 
+ttest_summary <- tibble(
+  Zeitpunkt     = c("Post", "FU"),
+  Wahrer_Wert   = c(true_post, true_fu),
+  Power         = c(power_post, power_fu),
+  Coverage      = c(coverage_post, coverage_fu),
+  RMSE          = c(rmse_post, rmse_fu),
+  Bias          = c(bias_post, bias_fu)
+)
+
+ttest_summary
+```
